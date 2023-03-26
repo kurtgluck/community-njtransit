@@ -1,0 +1,594 @@
+"""
+Applet: NJ Transit Dpature Vision
+Summary: Shows the next departing trains of a station
+Description: Shows the departing NJ Transit Trains of a selected station
+Author: jason-j-hunt
+"""
+
+load("cache.star", "cache")
+load("encoding/json.star", "json")
+load("html.star", "html")
+load("http.star", "http")
+load("render.star", "render")
+load("schema.star", "schema")
+#KAG - need time 
+load("time.star", "time")
+
+#URL TO NJ TRANSIT DEPARTURE VISION WEBSITE
+NJ_TRANSIT_DV_URL = "https://www.njtransit.com/dv-to"
+DEFAULT_STATION = "New York Penn Station"
+#KAG - default destination AND default time to get to station
+DEFAULT_DESTINATION_STATION = "Glen Ridge Station"
+DEFAULT_SKIP_BEFORE = "0"
+
+STATION_CACHE_KEY = "stations"
+STATION_CACHE_TTL = 604800  #1 Week
+
+DEPARTURES_CACHE_KEY = "departures"
+DEPARTURES_CACHE_TTL = 60  # 1 minute
+
+#KAG - TIMEZONE
+TRANSIT_TIME_ZONE = "America/New_York"
+###TRANSIT_TIME_LAYOUT = "20060102 15:04"
+#https://www.njtransit.com/train-to?origin=NY%20Penn%20Station&destination=Glen%20Ridge%20Station&date=03%2F20%2F2023
+NJ_TRANSIT_FROM_TO_DATE_URL = "https://www.njtransit.com/train-to?origin={}&destination={}&date={}"
+NJ_TRANSIT_FROM_TO_URL = "https://www.njtransit.com/train-to?origin={}&destination={}"
+
+#KAG - The app doesnt cache the actual train_view information - should be for a minute?
+# this looks like its a codeing error.  the TTL of the DEPARTURES_CACHE_KEY
+# makes it look like its the actual departure data, but instead its the translated
+# station options?
+#    Also - the key would have to include the station name that we
+#    are grabing the data for
+
+
+TIMEZONE = "America/New_York"
+
+#DISPLAYS FIRST 3 Departures by default
+DISPLAY_COUNT = 2
+
+#Gets Hex color code for a given service line
+COLOR_MAP = {
+    #Rail Lines
+    "ACRL": "#2e55a5",  #Atlantic City
+    "AMTK": "#ffca18",  #Amtrak
+    "BERG": "#c3c3c3",  #Bergen
+    "MAIN": "#fbb600",  #Main-Bergen Line
+    "MOBO": "#c26366",  #Montclair-Boonton
+    "M&E": "#28943b",  #Morris & Essex
+    "NEC": "#f54f5e",  #Northeast Corridor
+    "NJCL": "#339cdb",  #North Jersey Coast
+    "PASC": "#a34e8a",  #Pascack Valley
+    "RARV": "#ff9315",  #Raritan Valley
+}
+
+DEFAULT_COLOR = "#908E8E"  #If a line doesnt have a mapping fall back to this
+
+def main(config):
+    selected_station = config.get("station", DEFAULT_STATION)
+    #KAG - start
+    selected_destination = config.get("stationdestination", DEFAULT_DESTINATION_STATION)
+    skip_minutes_text = config.get("skipminutes", DEFAULT_SKIP_BEFORE)
+    skip_minutes = int(skip_minutes_text)
+
+    filter_trains_by_destination = selected_destination != selected_station
+    trains_to_destination = get_trains_from_to(filter_trains_by_destination, selected_station, selected_destination)
+    #KAG - end
+
+    departures = get_departures_for_station(selected_station)
+
+    #KAG - add list of trains we might want
+    #KAG - flag saying if we should use that list
+    #KAG - number of minutes from now to skip over
+    rendered_rows = render_departure_list(departures, skip_minutes, filter_trains_by_destination, trains_to_destination )
+    #rendered_rows = render_departure_list(departures)
+
+    return render.Root(
+        delay = 75,
+        max_age = 60,
+        child = rendered_rows,
+    )
+
+#def render_departure_list(departures):
+def render_departure_list(departures, skip_minutes, filter_trains_by_destination, trains_to_destination)
+    """
+    Renders a given lists of departures
+    Doesnt render trains leaving before skip_minutes 
+    If filter_trains_by_destination is True then will only render trains in the dictionary trains_to_destination
+    """
+    rendered = []
+
+    hhmm_of_now = time.now().in_location(TRANSIT_TIME_ZONE).format("2:04 PM")
+
+    for d in departures:
+        if is_this_train_ok(d.train_number, d.departing_in, skip_minutes, filter_trains_by_destination, trains_to_destination, hhmm_of_now ):
+            rendered.append(render_departure_row(d))
+
+    return render.Column(
+        expanded = True,
+        main_align = "start",
+        children = [
+            rendered[0],
+            render.Box(
+                width = 64,
+                height = 1,
+                color = "#666",
+            ),
+            rendered[1],
+        ],
+    )
+
+def is_this_train_ok(train_number, departing_in, skip_minutes, filter_trains_by_destination, trains_to_destination,nowhhmm):
+    """
+    KAG - Returns True if we should render this train False if not
+    Doesnt render trains leaving before skip_minutes 
+    If filter_trains_by_destination is True then will only render trains in the dictionary trains_to_destination
+    """
+    
+    integer_departing_in = departing_in AS CLEAN NUMBER OF MINUTES FROM NOW
+    if departing_in.startswith("at") :
+        integer_departing_minutes = minutes_from_now(nowhhmm,departing_in.removeprefix("at "))
+    else:
+        integer_departing_minutes = int(departing_in)
+        
+    integer_skip_minutes = int(skip_minutes)
+
+    print("is_this_train_ok(train_number='{}',departing_in='{}'=='{}',skip_minutes='{}'=='{}',filter_trains_by_destination='{}',trains_to_destination=DICTIONARY)".format(
+        train_number, departing_in, integer_departing_minutes, skip_minutes, integer_skip_minutes, filter_trains_by_destination)
+
+    
+    if integer_departing_minutes < integer_skip_minutes:
+        print("Train {} not ok it is leaving {}=={} Minutes which is Less than {}=={}".format(train_number,departing_in,integer_departing_in,skip_minutes,integer_skip_minutes)
+        return False
+              
+    if filter_trains_by_destination and ( trains_to_destination.get(train_number) == None ):
+        print("Train {} not ok it does not go where you want".format(train_number))
+        return False
+              
+    return True
+
+
+    
+
+def render_departure_row(departure):
+    """
+    Creates a Row and adds needed children objects
+    for a single departure.
+    """
+    background_color = render.Box(width = 22, height = 11, color = COLOR_MAP.get(departure.service_line, DEFAULT_COLOR))
+    destination_text = render.Marquee(
+        width = 36,
+        child = render.Text(departure.destination, font = "Dina_r400-6", offset = -2, height = 7),
+    )
+
+    departing_in_text = render.Text(departure.departing_in, color = "#f3ab3f")
+
+    #If we have a Track Number append and make it a scroll marquee
+    if departure.track_number != None:
+        depart = "{} - Track {}".format(departure.departing_in, departure.track_number)
+        departing_in_text = render.Marquee(
+            width = 36,
+            child = render.Text(depart, color = "#f3ab3f"),
+        )
+
+    if departure.departing_in.startswith("at"):
+        departing_in_text = render.Marquee(
+            width = 36,
+            child = render.Text(departure.departing_in, color = "#f3ab3f"),
+        )
+
+    child_train_number = render.Text(departure.train_number, font = "CG-pixel-4x5-mono")
+
+    if len(departure.train_number) > 4:
+        child_train_number = render.Marquee(child = child_train_number)
+
+    train_number = render.Box(
+        color = "#0000",
+        width = 22,
+        height = 11,
+        child = child_train_number,
+    )
+
+    stack = render.Stack(children = [
+        background_color,
+        train_number,
+    ])
+
+    column = render.Column(
+        children = [
+            destination_text,
+            departing_in_text,
+        ],
+    )
+
+    return render.Row(
+        expanded = True,
+        main_align = "space_evenly",
+        cross_align = "center",
+        children = [
+            stack,
+            column,
+        ],
+    )
+
+def get_schema():
+    options = getStationListOptions()
+    
+    # KAG - for pulldown list of minutes
+    minutesoptions = [
+        schema.Option(
+            display = "None",
+            value = "0",
+        ),
+        schema.Option(
+            display = "One minute",
+            value = "1",
+        ),
+        schema.Option(
+            display = "Two minutes",
+            value = "2",
+        ),
+        schema.Option(
+            display = "Three minutes",
+            value = "3",
+        ),
+        schema.Option(
+            display = "Four minutes",
+            value = "4",
+        ),
+        schema.Option(
+            display = "Five minutes",
+            value = "5",
+        ),
+        schema.Option(
+            display = "Ten minutes",
+            value = "10",
+        ),
+        schema.Option(
+            display = "Fifteen minutes",
+            value = "15",
+        ),
+        schema.Option(
+            display = "Twenty minutes",
+            value = "20",
+        ),
+        schema.Option(
+            display = "Half Hour",
+            value = "30",
+        ),
+        schema.Option(
+            display = "Three Quarters of an Hour",
+            value = "45",
+        ),
+        schema.Option(
+            display = "One Hour",
+            value = "60",
+        ),
+    ]
+
+
+    #KAG
+    #TODO - Do I have to change the version since i am adding to the schema?
+    #
+    #Added second Field to the Schema: Optional station you wish to go to.
+    #Output will be filtered so only trains that go to the destination will be in the output, including transfers.
+    #If you want origional behavor then make the destination the same as the departing station.
+    #
+    #Added third Field to the Schema:  Dont display trains leaving before this many minutes.
+    #Since display is only a couple of trains, lets not waste that display a train leaving
+    #before you can get to the station
+    
+    return schema.Schema(
+        version = "1",
+        fields = [
+            schema.Dropdown(
+                id = "station",
+                name = "Departing Station",
+                desc = "The NJ Transit Station to get departure schedule for.",
+                icon = "train",
+                default = options[0].value,
+                options = options,
+            ),
+            schema.Dropdown(
+                id = "stationdestination",
+                name = "Destination Station",
+                desc = "If different then Departing - then only show trains that get here (including connections).",
+                icon = "arrowRightToCity",
+                default = options[0].value,
+                options = options,
+            ),
+            schema.Dropdown(
+                id = "skipminutes",
+                name = "Skip Before",
+                desc = "Dont display trains leaving before",
+                icon = "personRunning",
+                default = minutesoptions[0].value,
+                options = minutesoptions,
+            ),
+            
+        ],
+    )
+
+def get_departures_for_station(station):
+    """
+    Function gets all depatures for a given station
+    returns a list of structs with the following fields
+
+    depature_item struct:
+        departing_at: string
+        destination: string
+        service_line: string
+        train_number: string
+        track_number: string
+        departing_in: string
+    """
+    #print("Getting departures for '%s'" % station)
+
+    station_suffix = station.replace(" ", "%20")
+    station_url = "{}/{}".format(NJ_TRANSIT_DV_URL, station_suffix)
+
+    #print(station_url)
+
+    nj_dv_page_response = http.get(station_url)
+
+    if nj_dv_page_response.status_code != 200:
+        #print("Got code '%s' from page response" % nj_dv_page_response.status_code)
+        return None
+
+    selector = html(nj_dv_page_response.body())
+    departures = selector.find(".border.mb-3.rounded")
+
+    #print("Found '%s' departures" % departures.len())
+
+    result = []
+
+    for index in range(0, departures.len()):
+        departure = departures.eq(index)
+        item = extract_fields_from_departure(departure)
+        result.append(item)
+
+        if len(result) == DISPLAY_COUNT:
+            return result
+
+    return result
+
+def extract_fields_from_departure(departure):
+    """
+    Function Extracts necessary data from HTML of a given depature
+    """
+    data = departure.find(".media-body").first()
+
+    departure_time = get_departure_time(data)
+    destination_name = get_destination_name(data)
+    service_line = get_service_line(data)
+    train_number = get_train_number(data)
+    track_number = get_track_number(data)
+    departing_in = get_real_time_estimated_departure(data, departure_time)
+
+    #print(
+    #    "{}\t{}\t{}\t{}\t{}\t{}\n".format(
+    #        departure_time,
+    #        destination_name,
+    #        service_line,
+    #        train_number,
+    #        track_number,
+    #        departing_in,
+    #    ),
+    #)
+
+    return struct(
+        departing_at = departure_time,
+        destination = destination_name,
+        service_line = service_line,
+        train_number = train_number,
+        track_number = track_number,
+        departing_in = departing_in,
+    )
+
+def get_departure_time(data):
+    """
+    Function gets depature time for a given depature
+    """
+    time_string = data.find(".d-block.ff-secondary--bold.flex-grow-1.h2.mb-0").first().text().strip()
+    return time_string
+
+def get_service_line(data):
+    """
+    Function gets the service line the train is running on
+    """
+    nodes = data.find(".media-body").first().find(".mb-0")
+    string = nodes.eq(1).text().strip().split()
+    service_line = string[0].strip()
+
+    return service_line
+
+def get_train_number(data):
+    """
+    Function gets the train number from a given depature
+    """
+    nodes = data.find(".media-body").first().find(".mb-0")
+    srvc_train_number = nodes.eq(1).text().strip().split()
+    train_number = srvc_train_number[2].strip()
+    return train_number
+
+def get_destination_name(data):
+    """
+    Function gets the destation froma  given depature
+    """
+    nodes = data.find(".media-body").first().find(".mb-0")
+    destination_name = nodes.eq(0).text().strip().replace("\\u2708", "EWR").upper()
+    return destination_name
+
+def get_real_time_estimated_departure(data, scheduled_time):
+    """
+    Will attempt to get given departing time from nj transit
+    If not availble will return the in X min via the scheduled
+    Departure time - time.now()
+    """
+    nodes = data.find(".media-body").first().find(".mb-0")
+    node = nodes.eq(2)
+
+    departing_in = ""
+
+    if node != None:
+        departing_in = node.text().strip().removeprefix("in ")
+
+    #If we cant get from NJT return scheduled Departure time
+    if len(departing_in) == 0:
+        departing_in = "at {}".format(scheduled_time)
+
+    return departing_in
+
+def get_track_number(data):
+    """
+    Returns the track number the train will be departing from.
+    May not be availble until about 10 minutes before scheduled departure time.
+    """
+    node = data.find(".align-self-end.mb-0").first()
+
+    if node != None:
+        text = node.text().strip().split()
+        if len(text) > 1:
+            track = text[1].strip()
+        else:
+            track = None
+    else:
+        track = None
+
+    return track
+
+def fetch_stations_from_website():
+    """
+    Function fetches trains station list from NJ Transit website
+    To be used for creating Schema option list
+    """
+    result = []
+
+    nj_dv_page_response_body = cache.get(DEPARTURES_CACHE_KEY)
+
+    if nj_dv_page_response_body == None:
+        nj_dv_page_response = http.get(NJ_TRANSIT_DV_URL)
+
+        if nj_dv_page_response.status_code != 200:
+            #print("Got code '%s' from page response" % nj_dv_page_response.status_code)
+            return result
+
+        nj_dv_page_response_body = nj_dv_page_response.body()
+
+        cache.set(DEPARTURES_CACHE_KEY, nj_dv_page_response.body(), DEPARTURES_CACHE_TTL)
+
+    selector = html(nj_dv_page_response_body)
+    stations = selector.find(".vbt-autocomplete-list.list-unstyled.position-absolute.pt-1.shadow.w-100").first().children()
+
+    #print("Got response of '%s' stations" % stations.len())
+
+    for index in range(0, stations.len()):
+        station = stations.eq(index)
+        station_name = station.find("a").first().text()
+
+        #print("Found station '%s' from page response" % station_name)
+        result.append(station_name)
+
+    return result
+
+def getStationListOptions():
+    """
+    Creates a list of schema options from station list
+    """
+    options = []
+    cache_string = cache.get(STATION_CACHE_KEY)
+
+    stations = None
+
+    if cache_string != None:
+        stations = json.decode(cache_string)
+
+    if stations == None:
+        stations = fetch_stations_from_website()
+        cache.set(STATION_CACHE_KEY, json.encode(stations), STATION_CACHE_TTL)
+
+    for station in stations:
+        options.append(create_option(station, station))
+
+    return options
+
+def create_option(display_name, value):
+    """
+    Helper function to create a schema option of a given display name and value
+    """
+    return schema.Option(
+        display = display_name,
+        value = value,
+    )
+
+def get_trains_from_to(filter_trains_by_destination, from_station, to_station):
+    """
+    Function gets trains from from_station to to_station
+    if filter_trains_by_destination is FALSE then just return an empty list
+    returns a hashmap? of train numbers of the form "#NNNN" ie:#6233
+    That is train #6233 leaves from from_station and either goes to, or connects to to_station
+    """
+    print("Get trains from '{}' to '{}' ".format(from_station,to_station))
+
+    #KAG - TODO
+    # Cache key should be FROM->TO string with a TTL of like an hour
+    # make sure we arent doing a query within the TTL of the EOD if so the TTL should be the time left in the day
+
+    # https://www.njtransit.com/train-
+    #NJ_TRANSIT_FROM_TO_DATE_URL = "https://www.njtransit.com/train-to?origin={}&destination={}&date={}"
+    #NJ_TRANSIT_FROM_TO_URL = "https://www.njtransit.com/train-to?origin={}&destination={}"
+
+    from_to_url = NJ_TRANSIT_FROM_TO_URL.format(from_station.replace(" ","%20"),to_station.replace(" ","%20"))
+
+
+
+              
+    trains = dict()
+
+    if filter_trains_by_destination:
+        #KAG: TODO add trains to the dictionary
+
+    return trains
+
+def hhmmam_to_minutes(hhmmam):
+    """
+    hhmmam_to_minutes( string of the form  HH:MM AM ie: 12:17 PM ) returns number of minutes from start of day
+    """
+              
+    s = hhmmam.strip().rstrip().lower()
+    is_pm = s.endswith("pm")
+    is_am = not(is_pm)
+    s_hh_col_mm = s.partition(":")
+    hh = int(s_hh_col_mm[0])
+    mm = int(s_hh_col_mm[2])
+    is_12 = ( hh == 12 )
+
+    if is_am and is_12:
+        return mm
+
+    if is_pm and is_12:
+        return ( hh * 60 ) + mm
+
+    if is_am and not(is_12):
+        return ( hh * 60 ) + mm
+
+    return ( ( hh + 12 ) * 60 ) + mm
+
+def minutes_from_now(nowhhmm, hhmm):
+    """
+    minutes_from_now(a,b) returns how many minutes are between two strings of the form 7:02 PM 
+    """
+    now_min = hhmmam_to_minutes(nowhhmm)
+    then_min = hhmmam_to_minutes(hhmm)
+    diff_min = then_min - now_min
+    if diff_min >= 0: return diff_min
+    
+    fourpm = 60 * 16
+    eightam = 60 * 8
+
+    if now_min >= fourpm and then_min <= eightam : return ( then_min + ( 60 * 24 ) ) - now_min
+
+    return diff_min
+    
+    
+              
