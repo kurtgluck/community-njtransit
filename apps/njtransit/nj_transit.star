@@ -1,5 +1,5 @@
 """
-Applet: NJ Transit Depature Vision
+Applet: NJ Transit Dpature Vision
 Summary: Shows the next departing trains of a station
 Description: Shows the departing NJ Transit Trains of a selected station
 Author: jason-j-hunt
@@ -11,16 +11,36 @@ load("html.star", "html")
 load("http.star", "http")
 load("render.star", "render")
 load("schema.star", "schema")
+#KAG - need time 
+load("time.star", "time")
 
 #URL TO NJ TRANSIT DEPARTURE VISION WEBSITE
 NJ_TRANSIT_DV_URL = "https://www.njtransit.com/dv-to"
 DEFAULT_STATION = "New York Penn Station"
+#KAG - default destination AND default time to get to station
+DEFAULT_DESTINATION_STATION = "Glen Ridge Station"
+DEFAULT_SKIP_BEFORE = "0"
 
 STATION_CACHE_KEY = "stations"
 STATION_CACHE_TTL = 604800  #1 Week
 
 DEPARTURES_CACHE_KEY = "departures"
 DEPARTURES_CACHE_TTL = 60  # 1 minute
+
+#KAG - TIMEZONE
+TRANSIT_TIME_ZONE = "America/New_York"
+###TRANSIT_TIME_LAYOUT = "20060102 15:04"
+#https://www.njtransit.com/train-to?origin=NY%20Penn%20Station&destination=Glen%20Ridge%20Station&date=03%2F20%2F2023
+NJ_TRANSIT_FROM_TO_DATE_URL = "https://www.njtransit.com/train-to?origin={}&destination={}&date={}"
+NJ_TRANSIT_FROM_TO_URL = "https://www.njtransit.com/train-to?origin={}&destination={}"
+
+#KAG - The app doesnt cache the actual train_view information - should be for a minute?
+# this looks like its a codeing error.  the TTL of the DEPARTURES_CACHE_KEY
+# makes it look like its the actual departure data, but instead its the translated
+# station options?
+#    Also - the key would have to include the station name that we
+#    are grabing the data for
+
 
 TIMEZONE = "America/New_York"
 
@@ -46,10 +66,19 @@ DEFAULT_COLOR = "#908E8E"  #If a line doesnt have a mapping fall back to this
 
 def main(config):
     selected_station = config.get("station", DEFAULT_STATION)
+    #KAG - start
+    selected_destination = config.get("stationdestination", DEFAULT_DESTINATION_STATION)
+
+    filter_trains_by_destination = selected_destination != selected_station
+    trains_to_destination = get_trains_from_to(filter_trains_by_destination, selected_station, selected_destination)
+    #KAG - end
 
     departures = get_departures_for_station(selected_station)
 
-    rendered_rows = render_departure_list(departures)
+    #KAG - add list of trains we might want
+    #KAG - flag saying if we should use that list
+    rendered_rows = render_departure_list(departures, filter_trains_by_destination, trains_to_destination )
+    #rendered_rows = render_departure_list(departures)
 
     return render.Root(
         delay = 75,
@@ -57,14 +86,25 @@ def main(config):
         child = rendered_rows,
     )
 
-def render_departure_list(departures):
+#def render_departure_list(departures):
+def render_departure_list(departures, filter_trains_by_destination, trains_to_destination):
     """
     Renders a given lists of departures
+    If filter_trains_by_destination is True then will only render trains in the dictionary trains_to_destination
     """
+
+    ### I know that I am doing extra work by not stoping the loop when DISPLAY_COUNT is exceeded - this is
+    ### to aid my debugging.  TODO improve this
+
+    render_count = 0 
+    
     rendered = []
 
     for d in departures:
-        rendered.append(render_departure_row(d))
+        train_number = d.train_number
+        if should_train_be_rendered(filter_trains_by_destination, trains_to_destination, train_number, render_count):
+            render_count = render_count + 1
+            rendered.append(render_departure_row(d))
 
     return render.Column(
         expanded = True,
@@ -79,6 +119,30 @@ def render_departure_list(departures):
             rendered[1],
         ],
     )
+
+def should_train_be_rendered(filter_trains_by_destination, trains_to_destination, train_number, rendered_so_far):
+    """
+    if filter_trains_by_destination is False then return True
+    Otherwise check to see if this train_number is in the dictionary trains_to_destination
+    """
+
+    print("should_train_be_rendered({},{},{},{})".format(filter_trains_by_destination, trains_to_destination, train_number, rendered_so_far ))
+
+    if rendered_so_far > DISPLAY_COUNT:
+        print("should_train_be_rendered() -> {} rendered exceeds {} DONT".format(rendered_so_far,DISPLAY_COUNT))
+        return False
+
+    if not(filter_trains_by_destination):
+        print("should_train_be_rendered() -> Dont filter so YES")
+        return True
+
+    dict_entry = trains_to_destination.get(train_number)
+    if dict_entry == None:
+        print("should_train_be_rendered() -> Train Not Found dont render")
+        return False
+
+    print("should_train_be_rendered() -> Train {} Found render".format(train_number))
+    return True
 
 def render_departure_row(departure):
     """
@@ -143,7 +207,15 @@ def render_departure_row(departure):
 
 def get_schema():
     options = getStationListOptions()
-
+    
+    #KAG
+    #TODO Do I have to change the version since i am adding to the schema?
+    #
+    #Added second Field to the Schema: Optional station you wish to go to.
+    #Output will be filtered so only trains that go to the destination will be in the output, including transfers.
+    #If you want origional behavor then make the destination the same as the departing station.
+    #
+    
     return schema.Schema(
         version = "1",
         fields = [
@@ -152,6 +224,14 @@ def get_schema():
                 name = "Departing Station",
                 desc = "The NJ Transit Station to get departure schedule for.",
                 icon = "train",
+                default = options[0].value,
+                options = options,
+            ),
+            schema.Dropdown(
+                id = "stationdestination",
+                name = "Destination Station",
+                desc = "If different then Departing - then only show trains that get here (including connections).",
+                icon = "arrowRightToCity",
                 default = options[0].value,
                 options = options,
             ),
@@ -172,22 +252,9 @@ def get_departures_for_station(station):
         departing_in: string
     """
     #print("Getting departures for '%s'" % station)
-
-    station_suffix = station.replace(" ", "%20")
-    station_url = "{}/{}".format(NJ_TRANSIT_DV_URL, station_suffix)
-
-    #print(station_url)
-
-    nj_dv_page_response = http.get(station_url)
-
-    if nj_dv_page_response.status_code != 200:
-        #print("Got code '%s' from page response" % nj_dv_page_response.status_code)
-        return None
-
-    selector = html(nj_dv_page_response.body())
-    departures = selector.find(".border.mb-3.rounded")
-
-    #print("Found '%s' departures" % departures.len())
+    print("========THEIR THERE======")
+    
+    print("get_departures_for_station({}) Found '{}' departures".format(station,departures.len()))
 
     result = []
 
@@ -196,8 +263,8 @@ def get_departures_for_station(station):
         item = extract_fields_from_departure(departure)
         result.append(item)
 
-        if len(result) == DISPLAY_COUNT:
-            return result
+        #if len(result) == DISPLAY_COUNT:
+        #    return result
 
     return result
 
@@ -323,7 +390,7 @@ def fetch_stations_from_website():
             return result
 
         nj_dv_page_response_body = nj_dv_page_response.body()
-
+              
         cache.set(DEPARTURES_CACHE_KEY, nj_dv_page_response.body(), DEPARTURES_CACHE_TTL)
 
     selector = html(nj_dv_page_response_body)
@@ -369,3 +436,127 @@ def create_option(display_name, value):
         display = display_name,
         value = value,
     )
+
+def get_trains_from_to(filter_trains_by_destination, from_station, to_station):
+    """
+    Function gets trains from from_station to to_station
+    if filter_trains_by_destination is FALSE then just return an empty list
+    returns a hashmap? of train numbers of the form "#NNNN" ie:#6233
+    That is train #6233 leaves from from_station and either goes to, or connects to to_station
+    """
+    print("Get trains from '{}' to '{}' ".format(from_station,to_station))
+
+    # https://www.njtransit.com/train-
+    #NJ_TRANSIT_FROM_TO_DATE_URL = "https://www.njtransit.com/train-to?origin={}&destination={}&date={}"
+    #NJ_TRANSIT_FROM_TO_URL = "https://www.njtransit.com/train-to?origin={}&destination={}"
+
+    cache_key = "from={}/to={}".format(from_station,to_station)
+    cache_ttl  = 60 * 30 # 1/2 hour
+
+    #trains = cache.get(cache_key)
+    #if trains != None:
+    #    print("get_trains_from_to cache hit {}".format(cache_key))
+    #    return trains
+              
+    trains = dict()
+    if not(filter_trains_by_destination): return trains
+              
+    from_to_url = NJ_TRANSIT_FROM_TO_URL.format(from_station.replace(" ","%20"),to_station.replace(" ","%20"))
+    print("==================URL")
+    print("from_to_url='{}'".format(from_to_url))
+    print("==================URL")
+
+    nj_page_response = http.get(from_to_url)
+    #nj_page_response = http.post(from_to_url)
+
+    #print("PR:::::: {} ::::::PR:::::::".format(nj_page_response))
+    
+    if nj_page_response.status_code != 200:
+        print("Got code '{}' from page response on {}".format( nj_page_response.status_code,from_to_url))
+        return trains
+
+    selector = html(nj_page_response.body())
+
+    print("=======================BODY")
+
+    print(" BODY={}=BODY".format(nj_page_response.body()))
+
+    print("=======================BODYS")
+
+    print(" BODYS={}=BODYS".format(selector))
+
+    #HANGS print("=======================JSON")
+
+    ##print(" JSON={}=JSON".format(nj_page_response.json()))
+
+    print("=======================FIND")
+
+    #key = ".media.border.flex-column.flex-md-row.mb-3.no-gutters.p-3.rounded"
+    #key = ".media.border.flex-column.flex-md-row.mb-3.no-gutters.p-3.rounded.bg-light"
+    #key = "media.border.flex-column.flex-md-row.mb-3.no-gutters.p-3.rounded.bg-light"
+    #key = "media.border.flex-column.flex-md-row.mb-3.no-gutters.p-3.rounded"
+    key = ".media-aside.mb-2.mb-md-0.align-self-start.col-12.col-md-4.order-0.order-md-1"
+    
+    thetrains = selector.find(key)
+
+    #class="media-aside mb-2 mb-md-0 align-self-start col-12 col-md-4 order-0 order-md-1"
+
+
+
+    print("Found '{}' trains on {}".format(thetrains.len(),from_to_url))
+
+    for index in range(0, thetrains.len()):
+        atrain = thetrains.eq(index)
+        atrain_tuple = extract_fields_from_schedule(atrain)
+        if atrain_tuple == None :
+              print("Hum train row {} from {} returned None".format(index,from_to_url))
+        else:
+              print("dictionary load '{}'='{}'".format(atrain_tuple[1],atrain_tuple[0]))
+              trains[atrain_tuple[1]] = atrain_tuple[0]
+
+    #TODO cache_ttl should be min(# seconds left in the day -1, cache_ttl)
+    #cache.set(cache_key, trains, cache_ttl)      
+
+    return trains
+            
+def extract_fields_from_schedule(aschedule):
+    """
+    Function Extracts necessary data from HTML of a given train on from to 
+    """
+
+    #"
+    #    Montclair-Boonton
+    #   
+    #    #6251
+    #   "
+
+    if aschedule == None:
+        print("extract_fields_from_schedule P1  passed None")
+        return None 
+   
+    data = aschedule.find(".media-body").first()
+    
+    if data == None:
+        print("extract_fields_from_schedule P2  .media-body Not found")
+        return None
+
+    the_string = data.find(".text-md-right.w-100").first().text().strip()
+    
+    if the_string == None:
+        print("extract_fields_from_schedule P3  .text-md-right.w-100 Not found")
+        return None
+
+    before_sep_after = the_string.partiton("#")
+    
+    if before_sep_after == None:
+        print("extract_fields_from_schedule P4  cant partition on #")
+        return None
+    
+    theline = before_sep_after[0].lstrip().strip()
+    sep = before_sep_after[1]
+    thetrainnumber = before_sep_after[2].lstrip().strip()
+
+    print("extract_fields_from_schedule line='{}' sep='{}' #='{}'",theline,sep,thetrainnumber)
+
+    return ( theline , thetrainnumber )
+    
